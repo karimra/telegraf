@@ -23,9 +23,28 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
+
+	nokiasros "github.com/karimra/nokiasros"
 )
 
 const sampleConfig = `
+ ## DIAL-OUT
+ ## enable dialout mode
+ enable_dialout = false
+
+ ## addr:port of telegraf grpc server
+ server_address = ":57400"
+
+ ## max message size
+ # max_msg_size = 0
+ 
+ ## enable server side TLS
+ # tls_cert = "/etc/telegraf/cert.pem"
+ # tls_key = "/etc/telegraf/key.pem"
+ # tls_allowed_cacerts = ["/etc/telegraf/clientca.pem"]
+ 
+ ## DIAL-IN
  ## Address and port of the GNMI GRPC server
  addresses = ["192.168.113.11:57400"]
 
@@ -85,12 +104,18 @@ type NokiaTelemetryGNMI struct {
 	// Telemetry type determines if this is a dial-in or dial-out subscription
 	// in case of dial-out, next configuration parameters have no effect.
 
-	TelemetryType string `toml:"telemetry_type,omitempty"`
+	EnableDialout bool `toml:"enable_dialout,omitempty"`
 
 	// dial-out
-	// ServerAddress string
-	// grpcServer *grpc.Server
-	// listener net.Listener
+	ServerAddress string `toml:"server_address,omitempty"`
+
+	MaxMsgSize int `toml:"max_msg_size"`
+
+	listener   net.Listener
+	grpcServer *grpc.Server
+
+	internaltls.ServerConfig
+	//gnmi.GNMIServer
 
 	// dial-in
 	Addresses     []string          `toml:"addresses"`
@@ -160,75 +185,42 @@ func (n *NokiaTelemetryGNMI) Gather(acc telegraf.Accumulator) error {
 func init() {
 	inputs.Add("nokia_telemetry_gnmi", func() telegraf.Input {
 		return &NokiaTelemetryGNMI{
-			Encoding: "json",
-			Redial:   internal.Duration{Duration: 10 * time.Second},
+			EnableDialout: false,
+			Encoding:      "json",
+			Redial:        internal.Duration{Duration: 10 * time.Second},
 		}
 	})
 }
 
 // Start //
 func (n *NokiaTelemetryGNMI) Start(acc telegraf.Accumulator) error {
-	var ctx context.Context
-	tlsCfg := new(tls.Config)
-
 	n.acc = acc
+	var ctx context.Context
 	ctx, n.cancel = context.WithCancel(context.Background())
 
-	request, err := n.newSubscribeRequest()
-	if err != nil {
-		return err
-	} else if n.Redial.Duration.Nanoseconds() <= 0 {
-		return fmt.Errorf("redial duration must be positive")
-	}
-
-	if n.EnableTLS {
-		if tlsCfg, err = n.ClientConfig.TLSConfig(); err != nil {
-			return err
+	errs := make([]error, 0, 2)
+	dialoutFailed := true
+	dialinFailed := true
+	if n.EnableDialout {
+		err := n.startDialoutServer(acc)
+		if err != nil {
+			n.Log.Warnf("failed to start plugin in dialout mode: %v", err)
+			errs = append(errs, err)
+		} else {
+			dialoutFailed = false
 		}
 	}
-
-	if len(n.Username) > 0 {
-		ctx = metadata.AppendToOutgoingContext(ctx, "username", n.Username, "password", n.Password)
-	}
-
-	n.aliases = make(map[string]string, len(n.Subscriptions)+len(n.Aliases))
-	for _, subscription := range n.Subscriptions {
-		var gnmiLongPath, gnmiShortPath *gnmi.Path
-
-		if gnmiLongPath, err = parsePath(subscription.Origin, subscription.Path, ""); err != nil {
-			return err
+	if len(n.Subscriptions) > 0 {
+		err := n.startDialInClients(ctx, acc)
+		if err != nil {
+			n.Log.Warnf("failed to start plugin in dial-in mode: %v", err)
+			errs = append(errs, err)
+		} else {
+			dialinFailed = false
 		}
-		n.Log.Debugf("gnmiLongPath: %+v", gnmiLongPath)
-		if gnmiShortPath, err = parsePath("", subscription.Path, ""); err != nil {
-			return err
-		}
-		n.Log.Debugf("gnmiShortPath: %+v", gnmiShortPath)
-		longPath, _ := n.handlePath(gnmiLongPath, nil, "")
-		shortPath, _ := n.handlePath(gnmiShortPath, nil, "")
-		n.Log.Debugf("longPath: %s", longPath)
-		n.Log.Debugf("shortPath: %s", shortPath)
-		n.aliases[longPath] = subscription.Name
-		n.aliases[shortPath] = subscription.Name
 	}
-	for alias, path := range n.Aliases {
-		n.aliases[path] = alias
-	}
-	n.Log.Debugf("Aliases: %+v", n.aliases)
-	n.wg.Add(len(n.Addresses))
-	for _, addr := range n.Addresses {
-		go func(address string) {
-			defer n.wg.Done()
-			for ctx.Err() == nil {
-				if err := n.subscribeGNMI(ctx, address, tlsCfg, request); err != nil && ctx.Err() == nil {
-					acc.AddError(err)
-				}
-
-				select {
-				case <-ctx.Done():
-				case <-time.After(n.Redial.Duration):
-				}
-			}
-		}(addr)
+	if dialinFailed && dialoutFailed {
+		return fmt.Errorf("both dialout and dial-in modes failed: %v || %v", errs[0], errs[1])
 	}
 	return nil
 }
@@ -314,12 +306,12 @@ func (n *NokiaTelemetryGNMI) subscribeGNMI(ctx context.Context, address string, 
 			break
 		}
 
-		n.handleSubscribeResponse(address, reply)
+		n.handleSubscribeResponse(address, reply, "")
 	}
 	return nil
 }
 
-func (n *NokiaTelemetryGNMI) handleSubscribeResponse(address string, reply *gnmi.SubscribeResponse) {
+func (n *NokiaTelemetryGNMI) handleSubscribeResponse(address string, reply *gnmi.SubscribeResponse, subscriptionName string) {
 	n.Log.Debugf("got notification: %+v", reply)
 	response, ok := reply.Response.(*gnmi.SubscribeResponse_Update)
 	if !ok {
@@ -355,7 +347,12 @@ func (n *NokiaTelemetryGNMI) handleSubscribeResponse(address string, reply *gnmi
 				n.Log.Debugf("No measurement alias for GNMI path: %s", name)
 			}
 		}
-
+		if subscriptionName != "" {
+			name = subscriptionName
+		}
+		if name == "" {
+			name = "from_dialout"
+		}
 		// Group metrics
 		for k, v := range fields {
 			key := k
@@ -371,6 +368,7 @@ func (n *NokiaTelemetryGNMI) handleSubscribeResponse(address string, reply *gnmi
 			}
 
 			grouper.Add(name, tags, timestamp, key, v)
+			n.Log.Debugf("measurement_name=%s, tags=%+v, timestamp=%s, key=%s, value=%v", name, tags, timestamp, key, v)
 		}
 
 		lastAliasPath = aliasPath
@@ -378,6 +376,7 @@ func (n *NokiaTelemetryGNMI) handleSubscribeResponse(address string, reply *gnmi
 
 	// Add grouped measurements
 	for _, metric := range grouper.Metrics() {
+		n.Log.Debugf("metric: %+v", metric)
 		n.acc.AddMetric(metric)
 	}
 }
@@ -478,6 +477,13 @@ func parsePath(origin string, path string, target string) (*gnmi.Path, error) {
 
 // Stop //
 func (n *NokiaTelemetryGNMI) Stop() {
+	if n.grpcServer != nil {
+		n.grpcServer.Stop()
+	}
+	if n.listener != nil {
+		n.listener.Close()
+	}
+
 	n.cancel()
 	n.wg.Wait()
 }
@@ -489,4 +495,136 @@ func snl(s string, l []string) bool {
 		}
 	}
 	return false
+}
+
+func (n *NokiaTelemetryGNMI) startDialoutServer(acc telegraf.Accumulator) error {
+	var err error
+	n.acc = acc
+	n.listener, err = net.Listen("tcp", n.ServerAddress)
+	if err != nil {
+		return err
+	}
+	n.aliases = make(map[string]string, len(n.Aliases))
+	for alias, path := range n.Aliases {
+		n.aliases[path] = alias
+	}
+	var opts []grpc.ServerOption
+	tlsConfig, err := n.ServerConfig.TLSConfig()
+	if err != nil {
+		n.listener.Close()
+		return err
+	} else if tlsConfig != nil {
+		opts = append(opts, grpc.Creds(credentials.NewTLS(tlsConfig)))
+	}
+
+	if n.MaxMsgSize > 0 {
+		opts = append(opts, grpc.MaxRecvMsgSize(n.MaxMsgSize))
+	}
+
+	n.grpcServer = grpc.NewServer(opts...)
+	nokiasros.RegisterDialoutTelemetryServer(n.grpcServer, n)
+	n.wg.Add(1)
+	go func() {
+		n.grpcServer.Serve(n.listener)
+		n.wg.Done()
+	}()
+	return nil
+}
+
+// Publish //
+func (n *NokiaTelemetryGNMI) Publish(stream nokiasros.DialoutTelemetry_PublishServer) error {
+	for {
+		md, ok := metadata.FromIncomingContext(stream.Context())
+		if ok {
+			n.Log.Debugf("Publish:::metadata = %+v", md)
+		}
+
+		peer, ok := peer.FromContext(stream.Context())
+		if ok {
+			n.Log.Debugf("connection from peer: %+v", peer)
+		}
+
+		subResp, err := stream.Recv()
+		n.Log.Debugf("%+v", subResp)
+		if err != nil {
+			if err != io.EOF {
+				n.acc.AddError(fmt.Errorf("GRPC dialout receive error: %v", err))
+			}
+			break
+		}
+		err = stream.Send(&nokiasros.PublishResponse{})
+		if err != nil {
+			n.Log.Debugf("error sending publish response to server: %v", err)
+		}
+		subName := fmt.Sprintf("from_dialout_%s", peer.Addr.String())
+		if sn, ok := md["subscription-name"]; ok {
+			if len(sn) > 0 {
+				subName = sn[0]
+			}
+		}
+		n.Log.Debugf("subscription-name: %v", subName)
+		n.handleSubscribeResponse(peer.Addr.String(), subResp, subName)
+	}
+	return nil
+}
+
+func (n *NokiaTelemetryGNMI) startDialInClients(ctx context.Context, acc telegraf.Accumulator) error {
+	tlsCfg := new(tls.Config)
+	request, err := n.newSubscribeRequest()
+	if err != nil {
+		return err
+	} else if n.Redial.Duration.Nanoseconds() <= 0 {
+		return fmt.Errorf("redial duration must be positive")
+	}
+
+	if n.EnableTLS {
+		if tlsCfg, err = n.ClientConfig.TLSConfig(); err != nil {
+			return err
+		}
+	}
+
+	if len(n.Username) > 0 {
+		ctx = metadata.AppendToOutgoingContext(ctx, "username", n.Username, "password", n.Password)
+	}
+
+	n.aliases = make(map[string]string, len(n.Subscriptions)+len(n.Aliases))
+	for _, subscription := range n.Subscriptions {
+		var gnmiLongPath, gnmiShortPath *gnmi.Path
+
+		if gnmiLongPath, err = parsePath(subscription.Origin, subscription.Path, ""); err != nil {
+			return err
+		}
+		n.Log.Debugf("gnmiLongPath: %+v", gnmiLongPath)
+		if gnmiShortPath, err = parsePath("", subscription.Path, ""); err != nil {
+			return err
+		}
+		n.Log.Debugf("gnmiShortPath: %+v", gnmiShortPath)
+		longPath, _ := n.handlePath(gnmiLongPath, nil, "")
+		shortPath, _ := n.handlePath(gnmiShortPath, nil, "")
+		n.Log.Debugf("longPath: %s", longPath)
+		n.Log.Debugf("shortPath: %s", shortPath)
+		n.aliases[longPath] = subscription.Name
+		n.aliases[shortPath] = subscription.Name
+	}
+	for alias, path := range n.Aliases {
+		n.aliases[path] = alias
+	}
+	n.Log.Debugf("Aliases: %+v", n.aliases)
+	n.wg.Add(len(n.Addresses))
+	for _, addr := range n.Addresses {
+		go func(address string) {
+			defer n.wg.Done()
+			for ctx.Err() == nil {
+				if err := n.subscribeGNMI(ctx, address, tlsCfg, request); err != nil && ctx.Err() == nil {
+					acc.AddError(err)
+				}
+
+				select {
+				case <-ctx.Done():
+				case <-time.After(n.Redial.Duration):
+				}
+			}
+		}(addr)
+	}
+	return nil
 }

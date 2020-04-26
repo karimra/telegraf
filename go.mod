@@ -56,7 +56,8 @@ require (
 	github.com/gogo/protobuf v1.2.2-0.20190723190241-65acae22fc9d
 	github.com/golang/geo v0.0.0-20190916061304-5b978397cfec
 	github.com/golang/mock v1.4.3 // indirect
-	github.com/golang/protobuf v1.3.5
+	github.com/golang/protobuf v1.4.0
+	github.com/google/gnxi v0.0.0-20191016182648-6697a080bc2d
 	github.com/google/go-cmp v0.4.0
 	github.com/google/go-github v17.0.0+incompatible
 	github.com/google/go-querystring v1.0.0 // indirect
@@ -77,6 +78,7 @@ require (
 	github.com/jackc/pgx v3.6.0+incompatible
 	github.com/jcmturner/gofork v1.0.0 // indirect
 	github.com/kardianos/service v1.0.0
+	github.com/karimra/nokiasros v0.0.0-00010101000000-000000000000
 	github.com/karrick/godirwalk v1.12.0
 	github.com/kballard/go-shellquote v0.0.0-20180428030007-95032a82bc51
 	github.com/klauspost/compress v1.9.2 // indirect
@@ -94,7 +96,7 @@ require (
 	github.com/nats-io/nats-server/v2 v2.1.4
 	github.com/nats-io/nats.go v1.9.1
 	github.com/nsqio/go-nsq v1.0.7
-	github.com/openconfig/gnmi v0.0.0-20180912164834-33a1865c3029
+	github.com/openconfig/gnmi v0.0.0-20200414194230-1597cc0f2600
 	github.com/opencontainers/go-digest v1.0.0-rc1 // indirect
 	github.com/opencontainers/image-spec v1.0.1 // indirect
 	github.com/opentracing-contrib/go-observer v0.0.0-20170622124052-a52f23424492 // indirect
@@ -135,7 +137,7 @@ require (
 	gonum.org/v1/gonum v0.6.2 // indirect
 	google.golang.org/api v0.20.0
 	google.golang.org/genproto v0.0.0-20200317114155-1f3552e48f24
-	google.golang.org/grpc v1.28.0
+	google.golang.org/grpc v1.29.1
 	gopkg.in/fatih/pool.v2 v2.0.0 // indirect
 	gopkg.in/gorethink/gorethink.v3 v3.0.5
 	gopkg.in/jcmturner/gokrb5.v7 v7.3.0 // indirect
@@ -150,3 +152,5 @@ require (
 
 // replaced due to https://github.com/satori/go.uuid/issues/73
 replace github.com/satori/go.uuid => github.com/gofrs/uuid v3.2.0+incompatible
+
+replace github.com/karimra/nokiasros => ../../../github.com/karimra/nokiasros
